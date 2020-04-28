@@ -123,7 +123,7 @@ public class PreProcTableStore implements TableStore {
 						}));
 					}
 				}
-				
+
 				/*
 				 * TODO IDEA: Directly write column chunks to cache instead of record batch
 				 * (Introduce 'ColumnStoreInterface' and make a single 'instance of' check in
@@ -160,6 +160,11 @@ public class PreProcTableStore implements TableStore {
 		@SuppressWarnings("unchecked")
 		final D casted = (D) m_results.get(index);
 		return casted;
+	}
+
+	@Override
+	public long size() {
+		return m_delegate.size();
 	}
 
 }

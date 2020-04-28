@@ -5,7 +5,6 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.Map.Entry;
 import java.util.TreeMap;
 
 import org.knime.core.data.column.ColumnChunk;
@@ -38,6 +37,7 @@ public class CachedTableStore implements TableStore, Flushable {
 	// size of cache
 	private int m_numChunks = 0;
 	private int m_flushIndex = 0;
+	private long m_size = 0;
 
 	private TableStore m_delegate;
 	private CachedTableReadStore m_readCache;
@@ -72,6 +72,7 @@ public class CachedTableStore implements TableStore, Flushable {
 					m_caches.get(i).put(m_numChunks, columnData[i]);
 				}
 				m_numChunks++;
+				m_size += data.getNumValues();
 				m_readCache.incNumChunks();
 			}
 
@@ -141,5 +142,10 @@ public class CachedTableStore implements TableStore, Flushable {
 		// TODO anything smart we can do here? Track created data? reuse data? etc?
 		// Later...
 		return m_delegate.createFactory();
+	}
+
+	@Override
+	public long size() {
+		return m_size;
 	}
 }
