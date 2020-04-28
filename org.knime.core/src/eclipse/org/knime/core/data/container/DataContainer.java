@@ -80,9 +80,18 @@ import org.knime.core.data.DataType;
 import org.knime.core.data.IDataRepository;
 import org.knime.core.data.RowIterator;
 import org.knime.core.data.RowKey;
+import org.knime.core.data.arrow.ArrowTableStoreFactory;
+import org.knime.core.data.column.ColumnType;
+import org.knime.core.data.container.fasttable.FastTableUtils;
+import org.knime.core.data.container.fasttable.RowWriter;
 import org.knime.core.data.filestore.internal.IWriteFileStoreHandler;
 import org.knime.core.data.filestore.internal.NotInWorkflowDataRepository;
 import org.knime.core.data.filestore.internal.NotInWorkflowWriteFileStoreHandler;
+import org.knime.core.data.preproc.PreProcTableStore;
+import org.knime.core.data.preproc.PreProcessingConfig;
+import org.knime.core.data.row.RowBatchUtils;
+import org.knime.core.data.table.TableUtils;
+import org.knime.core.data.table.store.TableStoreConfig;
 import org.knime.core.data.util.NonClosableInputStream;
 import org.knime.core.data.util.NonClosableOutputStream;
 import org.knime.core.data.util.memory.MemoryAlertSystem;
@@ -290,6 +299,14 @@ public class DataContainer implements RowAppender {
      */
     private boolean m_forceCopyOfBlobs;
 
+    // NEW NEW NEW
+    private PreProcTableStore m_store;
+
+    // TODO closed on shutdown? Versioned?
+    private ArrowTableStoreFactory m_factory = new ArrowTableStoreFactory();
+
+    private RowWriter m_writeCursor;
+
     /**
      * Consider using {@link ExecutionContext#createDataContainer(DataTableSpec)} instead of invoking this constructor
      * directly.
@@ -354,7 +371,8 @@ public class DataContainer implements RowAppender {
         final boolean forceSynchronousIO) {
         this(spec,
             DataContainerSettings.getDefault().withInitializedDomain(initDomain).withMaxCellsInMemory(maxCellsInMemory)
-                .withForceSequentialRowHandling(forceSynchronousIO || DataContainerSettings.getDefault().isForceSequentialRowHandling()));
+                .withForceSequentialRowHandling(
+                    forceSynchronousIO || DataContainerSettings.getDefault().isForceSequentialRowHandling()));
     }
 
     /**
@@ -364,6 +382,7 @@ public class DataContainer implements RowAppender {
      * @param settings the container settings
      * @noreference This constructor is not intended to be referenced by clients.
      */
+    @SuppressWarnings("resource")
     public DataContainer(final DataTableSpec spec, final DataContainerSettings settings) {
         CheckUtils.checkArgumentNotNull(spec, "Spec must not be null!");
         CheckUtils.checkArgument(settings.getMaxCellsInMemory() >= 0, "Cell count must be positive: %s",
@@ -398,13 +417,49 @@ public class DataContainer implements RowAppender {
         final int colCount = spec.getNumColumns();
         m_maxRowsInMemory = settings.getMaxCellsInMemory() / ((colCount > 0) ? colCount : 1);
         m_bufferCreator = new BufferCreator(settings.getBufferSettings());
+
+        /*
+         *  NEW NEW NEW NEW
+         */
+        boolean fastTableOn = true;
+        final ColumnType<?, ?>[] mappedSpec = fastTableOn ? FastTableUtils.deriveSpec(m_spec, true) : null;
+
+        // TODO highly inefficient blahblah
+        if (mappedSpec != null) {
+            try {
+                m_store = new PreProcTableStore(RowBatchUtils.cache(
+                    m_factory.create(mappedSpec, DataContainer.createTempFile(".knarrow"), new TableStoreConfig() {
+
+                        @Override
+                        public int getInitialChunkSize() {
+                            // TODO of course.
+                            return 1_000_000;
+                        }
+                    })), new PreProcessingConfig() {
+
+                        @Override
+                        public int[] getDomainEnabledIndices() {
+                            // TODO workaround... need better setting options for PreProcessingConfig of course :-)
+                            // TODO domain for all but rowkey.
+                            final int[] all = new int[mappedSpec.length - 1];
+                            for (int i = 0; i < all.length; i++) {
+                                all[i] = i + 1;
+                            }
+                            return null;
+                        }
+                    });
+                m_writeCursor = new RowWriter(TableUtils.createWriteTable(m_store).getCursor(), mappedSpec);
+            } catch (IOException ex) {
+                // TODO of course...
+                throw new RuntimeException(ex);
+            }
+        }
     }
 
     private void addRowToTableWrite(final DataRow row) {
         // let's do every possible sanity check
-        validateSpecCompatiblity(row);
         m_domainCreator.updateDomain(row);
-        addRowKeyForDuplicateCheck(row.getKey());
+        //        addRowKeyForDuplicateCheck(row.getKey());
         m_buffer.addRow(row, false, m_forceCopyOfBlobs);
     }
 
@@ -568,43 +623,65 @@ public class DataContainer implements RowAppender {
         if (isClosed()) {
             return;
         }
-        if (m_buffer == null) {
-            m_buffer = m_bufferCreator.createBuffer(m_spec, m_maxRowsInMemory, createInternalBufferID(),
-                getDataRepository(), getLocalTableRepository(), getFileStoreHandler());
-        }
-        if (!m_forceSequentialRowHandling) {
+
+        // NEW NEW NEW
+        if (m_store != null) {
             try {
-                if (m_writeThrowable.get() == null && !m_curBatch.isEmpty()) {
-                    submit();
+                m_writeCursor.close();
+                // TODO get rid of all of this...
+                initBufferIfRequired();
+                // TODO use correct spec
+                m_table = new ContainerTable(m_store, m_spec, m_buffer);
+
+                // TODO calculate domain
+                // TODO duplicate checking
+                // TODO what else? delete tmp files somewhere in case of error?
+                // TODO ...
+            } catch (Exception ex) {
+                // TODO
+                throw new RuntimeException(ex);
+            }
+        } else {
+
+            if (m_buffer == null) {
+                m_buffer = m_bufferCreator.createBuffer(m_spec, m_maxRowsInMemory, createInternalBufferID(),
+                    getDataRepository(), getLocalTableRepository(), getFileStoreHandler());
+            }
+            if (!m_forceSequentialRowHandling) {
+                try {
+                    if (m_writeThrowable.get() == null && !m_curBatch.isEmpty()) {
+                        submit();
+                    }
+                    waitForRunnableTermination();
+                } catch (final InterruptedException ie) {
+                    m_writeThrowable.compareAndSet(null, ie);
                 }
-                waitForRunnableTermination();
-            } catch (final InterruptedException ie) {
-                m_writeThrowable.compareAndSet(null, ie);
+                checkAsyncWriteThrowable();
+                for (final DataTableDomainCreator domainCreator : m_domainUpdaterPool) {
+                    m_domainCreator.merge(domainCreator);
+                }
             }
-            checkAsyncWriteThrowable();
-            for (final DataTableDomainCreator domainCreator : m_domainUpdaterPool) {
-                m_domainCreator.merge(domainCreator);
+            // create table spec _after_ all_ rows have been added (i.e. wait for
+            // asynchronous write thread to finish)
+            DataTableSpec finalSpec = m_domainCreator.createSpec();
+            m_buffer.close(finalSpec);
+            try {
+                m_duplicateChecker.checkForDuplicates();
+            } catch (IOException ioe) {
+                throw new DataContainerException("Failed to check for duplicate row IDs", ioe);
+            } catch (DuplicateKeyException dke) {
+                String key = dke.getKey();
+                throw new DuplicateKeyException("Found duplicate row ID \"" + key + "\" (at unknown position)", key);
             }
+            ContainerTable table = new ContainerTable(m_buffer);
+            getLocalTableRepository().put(table.getBufferID(), table);
+            m_table = table;
+            m_buffer = null;
+            m_spec = null;
+            m_duplicateChecker.clear();
+            m_duplicateChecker = null;
+            m_domainCreator = null;
         }
-        // create table spec _after_ all_ rows have been added (i.e. wait for
-        // asynchronous write thread to finish)
-        DataTableSpec finalSpec = m_domainCreator.createSpec();
-        m_buffer.close(finalSpec);
-        try {
-            m_duplicateChecker.checkForDuplicates();
-        } catch (IOException ioe) {
-            throw new DataContainerException("Failed to check for duplicate row IDs", ioe);
-        } catch (DuplicateKeyException dke) {
-            String key = dke.getKey();
-            throw new DuplicateKeyException("Found duplicate row ID \"" + key + "\" (at unknown position)", key);
-        }
-        m_table = new ContainerTable(m_buffer);
-        getLocalTableRepository().put(m_table.getBufferID(), m_table);
-        m_buffer = null;
-        m_spec = null;
-        m_duplicateChecker.clear();
-        m_duplicateChecker = null;
-        m_domainCreator = null;
         m_size = -1;
     }
 
@@ -728,11 +805,17 @@ public class DataContainer implements RowAppender {
         if (row == null) {
             throw new NullPointerException("Can't add null rows to container");
         }
-        initBufferIfRequired();
-        if (m_forceSequentialRowHandling) {
-            addRowToTableSynchronously(row);
+
+        //        validateSpecCompatiblity(row);
+        if (m_store == null) {
+            initBufferIfRequired();
+            if (m_forceSequentialRowHandling) {
+                addRowToTableSynchronously(row);
+            } else {
+                addRowToTableAsynchronously(row);
+            }
         } else {
-            addRowToTableAsynchronously(row);
+            m_writeCursor.push(row);
         }
         m_size += 1;
     }
@@ -1263,8 +1346,10 @@ public class DataContainer implements RowAppender {
             m_batchIdx = batchIdx;
             m_dataTableDomainCreator = domainCreator;
             m_dataTableDomainCreator.setBatchId(m_batchIdx);
-            /** The node context may be null if the DataContainer has been created outside of a node's context (e.g., in
-             * unit tests). This is also the reason why this class does not extend the RunnableWithContext class. */
+            /**
+             * The node context may be null if the DataContainer has been created outside of a node's context (e.g., in
+             * unit tests). This is also the reason why this class does not extend the RunnableWithContext class.
+             */
             m_nodeContext = NodeContext.getContext();
         }
 

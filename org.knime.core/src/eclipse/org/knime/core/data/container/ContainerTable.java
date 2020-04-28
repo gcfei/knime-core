@@ -53,8 +53,12 @@ import java.util.zip.ZipOutputStream;
 
 import org.knime.core.data.DataTableSpec;
 import org.knime.core.data.IDataRepository;
+import org.knime.core.data.container.fasttable.RowReader;
 import org.knime.core.data.container.filter.TableFilter;
 import org.knime.core.data.container.storage.TableStoreFormat;
+import org.knime.core.data.table.ReadTable;
+import org.knime.core.data.table.TableUtils;
+import org.knime.core.data.table.store.TableStore;
 import org.knime.core.node.BufferedDataTable;
 import org.knime.core.node.BufferedDataTable.KnowsRowCountTable;
 import org.knime.core.node.CanceledExecutionException;
@@ -64,32 +68,37 @@ import org.knime.core.node.NodeSettingsWO;
 import org.knime.core.node.util.CheckUtils;
 import org.knime.core.node.workflow.WorkflowDataRepository;
 
-
 /**
- * Class implementing the <code>DataTable</code> interface and using a buffer
- * from a <code>DataContainer</code> as data source. This class doesn't do
- * functional things. It only provides the <code>DataTable</code> methods.
+ * Class implementing the <code>DataTable</code> interface and using a buffer from a <code>DataContainer</code> as data
+ * source. This class doesn't do functional things. It only provides the <code>DataTable</code> methods.
  *
- * <p>We split it from the <code>Buffer</code> implementation as a buffer is
- * dynamic in size. This table should only be used when the buffer has been
- * fixed.
+ * <p>
+ * We split it from the <code>Buffer</code> implementation as a buffer is dynamic in size. This table should only be
+ * used when the buffer has been fixed.
+ *
  * @author Bernd Wiswedel, University of Konstanz
  */
 public final class ContainerTable implements KnowsRowCountTable {
 
-    private static final NodeLogger LOGGER =
-        NodeLogger.getLogger(ContainerTable.class);
+    private static final NodeLogger LOGGER = NodeLogger.getLogger(ContainerTable.class);
 
     /** To read the data from. */
     private Buffer m_buffer;
-    /** Contains functionality to copy the binary data to the temp file on
-     * demand (e.g. iterator is opened). */
-    private CopyOnAccessTask m_readTask;
-    private DataTableSpec m_spec;
 
     /**
-     * Create new Table based on a Buffer. This constructor is called from
-     * <code>DataContainer.getTable()</code>.
+     * Contains functionality to copy the binary data to the temp file on demand (e.g. iterator is opened).
+     */
+    private CopyOnAccessTask m_readTask;
+
+    private DataTableSpec m_spec;
+
+    private TableStore m_store;
+
+    private ReadTable m_readTable;
+
+    /**
+     * Create new Table based on a Buffer. This constructor is called from <code>DataContainer.getTable()</code>.
+     *
      * @param buffer To read data from.
      * @see DataContainer#getTable()
      */
@@ -99,9 +108,23 @@ public final class ContainerTable implements KnowsRowCountTable {
     }
 
     /**
+     * Create new Table based on a Buffer. This constructor is called from <code>DataContainer.getTable()</code>.
+     *
+     * @param buffer To read data from.
+     * @see DataContainer#getTable()
+     */
+    ContainerTable(final TableStore store, final DataTableSpec spec, final Buffer buffer) {
+        m_store = store;
+        m_spec = spec;
+        m_readTable = TableUtils.createReadTable(m_store);
+        // TODO no idea what I'm doing here
+        m_buffer = buffer;
+    }
+
+    /**
      * Constructor when table is read from file.
-     * @param readTask Carries out the copy process when iterator is requested
-     *        (just once).
+     *
+     * @param readTask Carries out the copy process when iterator is requested (just once).
      * @param spec The spec of this table.
      */
     ContainerTable(final CopyOnAccessTask readTask, final DataTableSpec spec) {
@@ -117,6 +140,7 @@ public final class ContainerTable implements KnowsRowCountTable {
         if (m_buffer != null) {
             return m_buffer.getTableSpec();
         }
+
         return m_spec;
     }
 
@@ -126,17 +150,18 @@ public final class ContainerTable implements KnowsRowCountTable {
     @Override
     public CloseableRowIterator iterator() {
         ensureBufferOpen();
-        return m_buffer.iterator();
+        return m_buffer.size() > 0 ? m_buffer.iterator() : new RowReader(m_readTable.newCursor(), m_spec);
     }
 
     @Override
     public CloseableRowIterator iteratorWithFilter(final TableFilter filter, final ExecutionMonitor exec) {
         ensureBufferOpen();
-        return m_buffer.iteratorWithFilter(filter, exec);
+        return m_buffer.size() > 0 ? m_buffer.iteratorWithFilter(filter, exec) : iterator();
     }
 
     /**
      * {@inheritDoc}
+     *
      * @deprecated use {@link #size()} instead which supports more than {@link Integer#MAX_VALUE} rows
      */
     @Override
@@ -147,16 +172,18 @@ public final class ContainerTable implements KnowsRowCountTable {
 
     /**
      * {@inheritDoc}
+     *
      * @since 3.0
      */
     @Override
     public long size() {
         ensureBufferOpen();
-        return m_buffer.size();
+        return m_buffer.size() > 0 ? m_buffer.size() : 1000000;
     }
 
-
-    /** Get reference to buffer.
+    /**
+     * Get reference to buffer.
+     *
      * @return The buffer backing this object.
      * @noreference This method is not intended to be referenced by clients.
      */
@@ -167,6 +194,7 @@ public final class ContainerTable implements KnowsRowCountTable {
 
     /**
      * Delegates to buffer to get its ID.
+     *
      * @return the buffer ID
      * @see Buffer#getBufferID()
      */
@@ -179,8 +207,7 @@ public final class ContainerTable implements KnowsRowCountTable {
 
     /**
      * Instruct the underlying buffer to cache the rows into main memory to accelerate future iterations. This method
-     * does nothing if the buffer is reading from memory already.
-     * see Buffer#setRestoreIntoMemoryOnCacheMiss()
+     * does nothing if the buffer is reading from memory already. see Buffer#setRestoreIntoMemoryOnCacheMiss()
      */
     protected void restoreIntoMemory() {
         if (m_buffer != null) {
@@ -191,13 +218,11 @@ public final class ContainerTable implements KnowsRowCountTable {
     }
 
     /**
-     * Do not call this method! Internal use!
-     * {@inheritDoc}
+     * Do not call this method! Internal use! {@inheritDoc}
      */
     @Override
-    public void saveToFile(final File f, final NodeSettingsWO settings,
-            final ExecutionMonitor exec) throws IOException,
-            CanceledExecutionException {
+    public void saveToFile(final File f, final NodeSettingsWO settings, final ExecutionMonitor exec)
+        throws IOException, CanceledExecutionException {
         ensureBufferOpen();
         try (ZipOutputStream zipOut = new ZipOutputStream(new BufferedOutputStream(new FileOutputStream(f)))) {
             m_buffer.addToZipFile(zipOut, exec);
@@ -248,16 +273,17 @@ public final class ContainerTable implements KnowsRowCountTable {
     @Override
     public boolean removeFromTableRepository(final WorkflowDataRepository dataRepository) {
         if (!dataRepository.removeTable(getBufferID()).isPresent()) {
-            LOGGER.debugWithFormat(
-                "Failed to remove container table with id %d from global table repository.", getBufferID());
+            LOGGER.debugWithFormat("Failed to remove container table with id %d from global table repository.",
+                getBufferID());
             return false;
         }
         return true;
     }
 
     /**
-     * Be mindful when to call this method. Any underlying resources will be released.
-     * Any subsequent iteration on the table will fail!
+     * Be mindful when to call this method. Any underlying resources will be released. Any subsequent iteration on the
+     * table will fail!
+     *
      * @see KnowsRowCountTable#clear()
      */
     @Override
@@ -272,36 +298,43 @@ public final class ContainerTable implements KnowsRowCountTable {
         }
     }
 
-    /** Do not use this method (only invoked by the framework).
-     * {@inheritDoc} */
+    /**
+     * Do not use this method (only invoked by the framework). {@inheritDoc}
+     */
     @Override
     public void ensureOpen() {
         ensureBufferOpen();
     }
 
-    /** Do not use!
-     * @return true when this table has been extracted to the temp location after workflow load or if this table
-     * was created during this session. It's false for tables which have not been opened.
+    /**
+     * Do not use!
+     *
+     * @return true when this table has been extracted to the temp location after workflow load or if this table was
+     *         created during this session. It's false for tables which have not been opened.
      * @noreference This method is not intended to be referenced by clients.
      */
     public boolean isOpen() {
-       return m_buffer != null;
+        return m_buffer != null;
     }
 
     static final BufferedDataTable[] EMPTY_ARRAY = new BufferedDataTable[0];
 
     /**
-     * Returns an empty array. This method is used internally.
-     * {@inheritDoc}
+     * Returns an empty array. This method is used internally. {@inheritDoc}
      */
     @Override
     public BufferedDataTable[] getReferenceTables() {
         return EMPTY_ARRAY;
     }
 
-    /** Executes the copy process when the content of this table is demanded
-     * for the first time. */
+    /**
+     * Executes the copy process when the content of this table is demanded for the first time.
+     */
     private void ensureBufferOpen() {
+        // TODO later
+        if (m_store != null) {
+            return;
+        }
         CopyOnAccessTask readTask = m_readTask;
         // do not synchronize this check here as this method most of the
         // the times returns immediately
@@ -318,9 +351,8 @@ public final class ContainerTable implements KnowsRowCountTable {
             try {
                 m_buffer = m_readTask.createBuffer();
             } catch (IOException i) {
-                throw new RuntimeException("Exception while accessing file: \""
-                        + m_readTask.getFileName() + "\": "
-                        + i.getMessage(), i);
+                throw new RuntimeException(
+                    "Exception while accessing file: \"" + m_readTask.getFileName() + "\": " + i.getMessage(), i);
             }
             m_spec = null;
             m_readTask = null;

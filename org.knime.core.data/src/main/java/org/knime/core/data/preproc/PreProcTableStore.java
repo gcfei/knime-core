@@ -101,7 +101,6 @@ public class PreProcTableStore implements TableStore {
 				 * This means that adding data to the cache only helps if we can do work in the
 				 * cache while the domain is being processed (e.g. flush).
 				 */
-
 				if (m_enabled != null && m_enabled.length > 0) {
 					final ColumnChunk[] recordData = record.getRecordData();
 					for (int i = 0; i < m_enabled.length; i++) {
@@ -124,7 +123,7 @@ public class PreProcTableStore implements TableStore {
 						}));
 					}
 				}
-
+				
 				/*
 				 * TODO IDEA: Directly write column chunks to cache instead of record batch
 				 * (Introduce 'ColumnStoreInterface' and make a single 'instance of' check in
@@ -133,7 +132,6 @@ public class PreProcTableStore implements TableStore {
 				 */
 				writer.write(record);
 			}
-
 		};
 	}
 
